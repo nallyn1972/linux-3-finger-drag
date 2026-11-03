@@ -211,6 +211,33 @@ impl Hand {
     }
 }
 
+/// The kernel only sends ABS_MT_SLOT when the slot actually changes
+/// from the last one it emitted: a frame touching the same slot as the
+/// previous frame carries no SLOT event at all, and its events apply to
+/// whatever slot the *reader* last selected. The hand always names its
+/// slot explicitly, so without this filter the stress test could never
+/// see a clone whose current slot has drifted from the real pad's.
+#[derive(Default)]
+struct KernelSlotFilter {
+    last: Option<i32>,
+}
+
+impl KernelSlotFilter {
+    fn filter(&mut self, evs: Vec<Ev>) -> Vec<Ev> {
+        evs.into_iter()
+            .filter(|ev| {
+                if ev.type_ == EV_ABS && ev.code == ABS_MT_SLOT {
+                    if self.last == Some(ev.value) {
+                        return false;
+                    }
+                    self.last = Some(ev.value);
+                }
+                true
+            })
+            .collect()
+    }
+}
+
 fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
     let mut rng = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
     let mut m = GestureMachine::new(
@@ -230,6 +257,7 @@ fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
         ..Default::default()
     };
     let mut hand = Hand::new();
+    let mut kernel = KernelSlotFilter::default();
     let mut now = Instant::now();
     let mut expect_held = false;
 
@@ -278,7 +306,7 @@ fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
         apply(&outs, &mut shadow, &mut expect_held, "tick2");
 
         if !evs.is_empty() || rng.below(4) == 0 {
-            let mut frame = evs;
+            let mut frame = kernel.filter(evs);
             frame.push(Ev::syn());
             let outs = m.on_frame(&frame, now);
             apply(&outs, &mut shadow, &mut expect_held, "frame");
@@ -293,11 +321,14 @@ fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
                     None => (-1, 0, 0),
                 })
                 .collect();
+            if let Some(slot) = kernel.last {
+                m.set_current_slot(slot);
+            }
             let outs = m.on_resync(&snapshot, now);
             apply(&outs, &mut shadow, &mut expect_held, "resync");
             // a resync may swallow tool state legitimately; re-assert
             // the hand's tool bits on the next frame like hardware would
-            let mut frame = hand.wiggle(&mut rng);
+            let mut frame = kernel.filter(hand.wiggle(&mut rng));
             frame.push(Ev::syn());
             let outs = m.on_frame(&frame, now);
             apply(&outs, &mut shadow, &mut expect_held, "post-resync");
@@ -332,7 +363,7 @@ fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
         if evs.is_empty() {
             break;
         }
-        let mut frame = evs;
+        let mut frame = kernel.filter(evs);
         frame.push(Ev::syn());
         now += Duration::from_millis(9);
         let outs = m.on_frame(&frame, now);

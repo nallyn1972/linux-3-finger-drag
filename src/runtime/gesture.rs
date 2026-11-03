@@ -146,6 +146,16 @@ pub struct GestureMachine {
 
     slots: [Slot; MAX_SLOTS],
     current_slot: usize,
+    /// The slot the *synthetic clone's* event stream is positioned on
+    /// (the last ABS_MT_SLOT we wrote to it). Relayed frames omit SLOT
+    /// whenever the real pad's slot didn't change, so they're only
+    /// correct if the clone is on the same slot the real stream was on
+    /// when the frame began -- see `emit_relayed`.
+    clone_slot: usize,
+    /// `current_slot` as it was before the frame being processed.
+    frame_start_slot: usize,
+    /// `current_slot` as it was before the first frame now in `pending`.
+    pending_start_slot: usize,
     /// Which slots the *synthetic clone* currently believes are active.
     relayed_active: [bool; MAX_SLOTS],
 
@@ -200,6 +210,9 @@ impl GestureMachine {
             slot_count: slot_count.clamp(1, MAX_SLOTS),
             slots: [Slot::default(); MAX_SLOTS],
             current_slot: 0,
+            clone_slot: 0,
+            frame_start_slot: 0,
+            pending_start_slot: 0,
             relayed_active: [false; MAX_SLOTS],
             suppressing: false,
             drag_ref_slot: None,
@@ -226,6 +239,16 @@ impl GestureMachine {
 
     /// Whether the virtual button is currently held (used by the shell
     /// for a defensive release on shutdown).
+    /// Tell the machine which slot the real device's event stream is
+    /// currently positioned on. Needed after a SYN_DROPPED: the dropped
+    /// events may have included ABS_MT_SLOT changes, and the kernel will
+    /// not repeat a SLOT event for a slot it already selected, so the
+    /// I/O shell re-reads it (EVIOCGABS) and hands it in before
+    /// [`on_resync`](Self::on_resync).
+    pub fn set_current_slot(&mut self, slot: i32) {
+        self.current_slot = (slot.max(0) as usize).min(self.slot_count - 1);
+    }
+
     pub fn button_held(&self) -> bool {
         self.held
     }
@@ -304,6 +327,7 @@ impl GestureMachine {
     /// be fed; discard them and call [`on_resync`](Self::on_resync)
     /// with a fresh kernel snapshot instead.
     pub fn on_frame(&mut self, frame: &[Ev], now: Instant) -> Vec<Output> {
+        self.frame_start_slot = self.current_slot;
         // 1. fold the frame's slot and key-state updates into our model
         for ev in frame {
             if ev.type_ == EV_KEY {
@@ -408,14 +432,19 @@ impl GestureMachine {
             }
             if !correction.is_empty() {
                 if buffering {
+                    if self.pending.is_empty() {
+                        self.pending_start_slot = self.current_slot;
+                    }
                     self.pending.extend(correction);
+                    self.pending.push(self.slot_restore());
                     self.pending.push(Ev::syn());
                     self.mark_pending();
                 } else {
                     let mut frame = correction;
+                    frame.push(self.slot_restore());
                     frame.push(Ev::syn());
                     self.mark_relayed();
-                    out.push(Output::EmitSynth(frame));
+                    self.emit(frame, &mut out);
                 }
             }
         }
@@ -514,9 +543,10 @@ impl GestureMachine {
                         Self::note_key(&mut self.clone_keys, code, value);
                     }
                 }
+                intro.push(self.slot_restore());
                 intro.push(Ev::syn());
                 self.mark_relayed();
-                out.push(Output::EmitSynth(intro));
+                self.emit(intro, out);
                 return;
             }
             self.drive_drag(&active, out);
@@ -533,6 +563,9 @@ impl GestureMachine {
                 // Touch ended before a decision was reached (e.g. a
                 // quick tap): flush everything buffered, including this
                 // release frame, so the tap isn't silently swallowed.
+                if self.pending.is_empty() {
+                    self.pending_start_slot = self.frame_start_slot;
+                }
                 self.pending.extend_from_slice(frame);
                 self.flush_pending(out);
                 return;
@@ -573,6 +606,9 @@ impl GestureMachine {
             return;
         }
 
+        if self.pending.is_empty() {
+            self.pending_start_slot = self.frame_start_slot;
+        }
         self.pending.extend_from_slice(frame);
         self.mark_pending();
 
@@ -642,7 +678,8 @@ impl GestureMachine {
         if !self.pending.is_empty() {
             let flushed = std::mem::take(&mut self.pending);
             self.note_clone_keys(&flushed);
-            out.push(Output::EmitSynth(flushed));
+            let start = self.pending_start_slot;
+            self.emit_relayed(start, flushed, out);
         }
         // pending is now empty (or was already) -- whatever it knew
         // about is either relayed for real now, or moot.
@@ -654,7 +691,8 @@ impl GestureMachine {
         self.mark_relayed();
         if !frame.is_empty() {
             self.note_clone_keys(frame);
-            out.push(Output::EmitSynth(frame.to_vec()));
+            let start = self.frame_start_slot;
+            self.emit_relayed(start, frame.to_vec(), out);
         }
     }
 
@@ -722,8 +760,9 @@ impl GestureMachine {
             }
         }
         if !release.is_empty() {
+            release.push(self.slot_restore());
             release.push(Ev::syn());
-            out.push(Output::EmitSynth(release));
+            self.emit(release, out);
         }
     }
 
@@ -778,6 +817,47 @@ impl GestureMachine {
             return;
         }
         self.drag_last_pos = Some((x, y));
+    }
+
+    /// Every write to the clone goes through here, so `clone_slot`
+    /// always knows which slot the clone's stream is positioned on.
+    fn emit(&mut self, evs: Vec<Ev>, out: &mut Vec<Output>) {
+        for ev in &evs {
+            if ev.type_ == EV_ABS && ev.code == ABS_MT_SLOT {
+                self.clone_slot = (ev.value.max(0) as usize).min(self.slot_count - 1);
+            }
+        }
+        out.push(Output::EmitSynth(evs));
+    }
+
+    /// Writes real-device events to the clone verbatim, first
+    /// re-selecting `start_slot` (the real stream's slot when these
+    /// events began) if the clone is on a different one. Without this,
+    /// any gap in relaying -- a suppressed drag, during which the real
+    /// pad changes slots the clone never hears about -- leaves the next
+    /// relayed frame's slot-less events landing on the wrong clone slot.
+    fn emit_relayed(&mut self, start_slot: usize, mut evs: Vec<Ev>, out: &mut Vec<Output>) {
+        if self.clone_slot != start_slot {
+            evs.insert(0, Ev::abs(ABS_MT_SLOT, start_slot as i32));
+        }
+        self.emit(evs, out);
+    }
+
+    /// The closing ABS_MT_SLOT for any frame the machine writes itself.
+    ///
+    /// The kernel only emits ABS_MT_SLOT when the slot changes, so every
+    /// relayed frame's events land on whichever slot the *clone* last
+    /// selected. Relayed frames keep the clone in step with the real pad
+    /// automatically; a synthesized frame (suppression release, late-4th
+    /// handoff, resync correction) ends on whatever slot it touched last,
+    /// which can differ. The next relayed frame that omits SLOT then
+    /// lands on the wrong clone slot: a touch opened in, or moved in, a
+    /// slot libinput thinks is somewhere else -- "double tracking ID"
+    /// and a compositor that silently stops scrolling until the clone is
+    /// recreated. Re-selecting the real pad's slot before SYN_REPORT
+    /// costs nothing (the kernel only stages it) and keeps them in step.
+    fn slot_restore(&self) -> Ev {
+        Ev::abs(ABS_MT_SLOT, self.current_slot as i32)
     }
 
     /// SLOT/TRACKING_ID/X/Y events asserting the current state of every

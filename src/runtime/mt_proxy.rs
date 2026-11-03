@@ -162,6 +162,13 @@ impl MtProxy {
         self.slot_count
     }
 
+    /// The slot the real device's event stream is currently positioned
+    /// on (EVIOCGABS(ABS_MT_SLOT)): events that follow without their own
+    /// ABS_MT_SLOT apply to it.
+    pub fn real_slot(&self) -> io::Result<i32> {
+        Ok(self.real.absolute_info(AbsoluteAxis::MultitouchSlot)?.value)
+    }
+
     /// Builds a synthetic uinput device with the same EV_KEY/EV_ABS/
     /// INPUT_PROP capabilities as the real device, so the compositor's
     /// libinput sees something functionally identical to the hardware.
@@ -254,6 +261,10 @@ impl MtProxy {
                     if raw.type_ == EV_SYN && raw.code == SYN_REPORT {
                         self.dropping = false;
                         let snapshot = self.slot_snapshot()?;
+                        // the dropped events may have moved the real
+                        // stream's current slot; re-read it so the
+                        // clone can be re-pointed at the same slot
+                        machine.set_current_slot(self.real_slot()?);
                         let outs = machine.on_resync(&snapshot, Instant::now());
                         self.apply(&outs, vtp)?;
                     }

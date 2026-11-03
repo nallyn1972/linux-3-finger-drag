@@ -155,6 +155,9 @@ async fn run(
             proxy.y_res(),
             proxy.slot_count(),
         );
+        // the real pad's stream may already be positioned on a slot other
+        // than 0 (the kernel won't repeat it), so start from the truth
+        machine.set_current_slot(proxy.real_slot()?);
         let watch = AsyncFd::with_interest(FdWatch(proxy.as_raw_fd()), Interest::READABLE)?;
 
         info!("linux-3-finger-drag started successfully!");

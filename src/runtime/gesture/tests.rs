@@ -910,3 +910,41 @@ fn button_held_tracks_drag_state() {
     sim.frame_at(30, &cat(&[&up(0), &up(1), &up(2)]));
     assert!(!sim.m.button_held());
 }
+
+/// THE CLONE-SLOT DRIFT BUG: the kernel omits ABS_MT_SLOT when the slot
+/// hasn't changed, so relayed frames are only right if the clone is on
+/// the same slot as the real stream. A suppressed drag changes the real
+/// stream's slot without the clone hearing about it; the next touch's
+/// slot-less touchdown must be re-pointed at the right clone slot, or it
+/// opens a touch in the wrong slot ("double tracking ID" in libinput,
+/// two-finger scroll dead until the clone is recreated).
+#[test]
+fn relay_after_drag_reselects_real_slot_on_clone() {
+    let mut sim = Sim::new();
+    // 1. an ordinary one-finger touch in slot 2: the clone ends on slot 2
+    sim.frame(&down(2, 1, 500, 500));
+    sim.tick(15);
+    sim.frame_at(5, &[Ev::abs(ABS_MT_TRACKING_ID, -1)]); // slot 2 implied
+
+    // 2. a 3-finger drag whose last events are in slot 0: the real
+    //    stream ends on slot 0, the clone (never told) is still on 2
+    sim.frame_at(100, &cat(&[&down(1, 2, 100, 100), &down(2, 3, 200, 100), &down(0, 4, 300, 100)]));
+    sim.tick(100);
+    sim.frame_at(10, &[Ev::abs(ABS_MT_POSITION_X, 320)]); // slot 0 implied
+    sim.frame_at(10, &cat(&[&up(1), &up(2), &up(0)]));
+    sim.tick(1000);
+
+    // 3. a new one-finger touch in slot 0, slot-less as the kernel sends it
+    sim.frame_at(100, &[
+        Ev::abs(ABS_MT_TRACKING_ID, 5),
+        Ev::abs(ABS_MT_POSITION_X, 600),
+        Ev::abs(ABS_MT_POSITION_Y, 600),
+    ]);
+    let outs = sim.tick(15);
+    let evs = synth_events(&outs);
+    assert_eq!(
+        evs.first(),
+        Some(&Ev::abs(ABS_MT_SLOT, 0)),
+        "clone must be re-pointed at the real slot before the touchdown: {evs:?}"
+    );
+}
